@@ -43,6 +43,11 @@ const s3Client = new S3Client({
   region: S3_REGION,
 });
 
+// einfacher Sleep-Helper
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // ==== HEALTHCHECK ====
 app.get("/", (req, res) => {
   res.json({ status: "ok", message: "Shopify image rotate service running" });
@@ -61,6 +66,11 @@ app.get("/", (req, res) => {
  * }
  *
  * rotation optional, default: 90 (Grad im Uhrzeigersinn)
+ *
+ * Logik:
+ * - Erst 3 Minuten warten (Bild-Rendering bei TeeInBlue)
+ * - Dann bis zu 4 Versuche, das Bild zu holen und zu verarbeiten
+ * - Zwischen den Versuchen jeweils 1 Minute Pause
  */
 app.post("/rotate-and-update", async (req, res) => {
   const {
@@ -80,48 +90,111 @@ app.post("/rotate-and-update", async (req, res) => {
 
   const rotationAngle = rotation || 90;
 
-  try {
-    // 1. Bild herunterladen
-    const imageResponse = await axios.get(image_url, {
-      responseType: "arraybuffer",
-    });
-    const originalBuffer = Buffer.from(imageResponse.data);
+  // Retry-Konfiguration
+  const maxAttempts = 4;
+  const initialDelayMs = 3 * 60 * 1000; // 3 Minuten
+  const retryDelayMs = 60 * 1000; // 1 Minute
 
-    // 2. Bild drehen (90° im Uhrzeigersinn, Ausgabe PNG)
-    const rotatedBuffer = await sharp(originalBuffer)
-      .rotate(rotationAngle)
-      .toFormat("png")
-      .toBuffer();
+  console.log(
+    `Neue Anfrage /rotate-and-update für Produkt ${product_id}, warte zuerst 3 Minuten bevor das Bild geladen wird...`
+  );
 
-    // 3. Bild in S3 hochladen, URL zurückbekommen
-    const rotatedImageUrl = await uploadToS3AndGetUrl(
-      rotatedBuffer,
-      image_url
+  // 1. Initiale Wartezeit (Bild rendern lassen)
+  await sleep(initialDelayMs);
+
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    console.log(
+      `Versuch ${attempt}/${maxAttempts}, Bild von URL laden: ${image_url}`
     );
 
-    // 4. Produkt-Metafeld aktualisieren
-    const metafieldUpdateResponse = await setProductMetafieldString(
-      product_id,
-      metafield_namespace,
-      metafield_key,
-      rotatedImageUrl
-    );
+    try {
+      // 2. Bild herunterladen
+      const imageResponse = await axios.get(image_url, {
+        responseType: "arraybuffer",
+        validateStatus: (status) => status >= 200 && status < 500, // 4xx selbst behandeln
+      });
 
-    return res.json({
-      success: true,
-      rotated_image_url: rotatedImageUrl,
-      metafield_update_result: metafieldUpdateResponse.data,
-    });
-  } catch (err) {
-    console.error("Fehler im /rotate-and-update:", err.message);
-    if (err.response) {
-      console.error("Response data:", err.response.data);
+      if (imageResponse.status !== 200) {
+        throw new Error(
+          `Bild noch nicht verfügbar oder Fehlerstatus: HTTP ${imageResponse.status}`
+        );
+      }
+
+      const contentType = imageResponse.headers["content-type"] || "";
+      if (!contentType.startsWith("image/")) {
+        throw new Error(
+          `Antwort ist kein Bild. Content-Type: ${contentType || "unbekannt"}`
+        );
+      }
+
+      const originalBuffer = Buffer.from(imageResponse.data);
+
+      // 3. Bild drehen (90° im Uhrzeigersinn, Ausgabe PNG)
+      const rotatedBuffer = await sharp(originalBuffer)
+        .rotate(rotationAngle)
+        .toFormat("png")
+        .toBuffer();
+
+      // 4. Bild in S3 hochladen, URL zurückbekommen
+      const rotatedImageUrl = await uploadToS3AndGetUrl(
+        rotatedBuffer,
+        image_url
+      );
+
+      console.log(
+        `Bild erfolgreich verarbeitet und hochgeladen: ${rotatedImageUrl}`
+      );
+
+      // 5. Produkt-Metafeld aktualisieren
+      const metafieldUpdateResponse = await setProductMetafieldString(
+        product_id,
+        metafield_namespace,
+        metafield_key,
+        rotatedImageUrl
+      );
+
+      console.log(
+        `Metafeld aktualisiert für Produkt ${product_id}, Namespace=${metafield_namespace}, Key=${metafield_key}`
+      );
+
+      // Erfolg – Response zurück an Flow
+      return res.json({
+        success: true,
+        rotated_image_url: rotatedImageUrl,
+        metafield_update_result: metafieldUpdateResponse.data,
+        attempts_used: attempt,
+      });
+    } catch (err) {
+      lastError = err;
+      console.error(
+        `Fehler beim Versuch ${attempt}/${maxAttempts}:`,
+        err.message
+      );
+      if (err.response) {
+        console.error("Response data:", err.response.data);
+      }
+
+      if (attempt < maxAttempts) {
+        console.log(
+          `Warte ${retryDelayMs / 1000} Sekunden vor dem nächsten Versuch...`
+        );
+        await sleep(retryDelayMs);
+      }
     }
-    return res.status(500).json({
-      error: "Interner Fehler beim Drehen oder Aktualisieren",
-      details: err.message,
-    });
   }
+
+  console.error(
+    `Maximale Anzahl Versuche (${maxAttempts}) erreicht, Bild konnte nicht erfolgreich geladen/verarbeitet werden.`
+  );
+
+  return res.status(500).json({
+    error:
+      "Bild konnte nach mehreren Versuchen nicht geladen/verarbeitet werden",
+    details: lastError ? lastError.message : "Unbekannter Fehler",
+    attempts_used: maxAttempts,
+  });
 });
 
 /**
@@ -139,10 +212,15 @@ async function uploadToS3AndGetUrl(fileBuffer, originalImageUrl) {
     const originalName = urlObj.pathname.split("/").pop();
     if (originalName) {
       // denselben Namen verwenden, aber in einen "rotated" Ordner packen
-      filename = originalName.replace(/\.(png|jpg|jpeg|webp)$/i, "") + "-rotated.png";
+      filename = originalName.replace(
+        /\.(png|jpg|jpeg|webp)$/i,
+        ""
+      ) + "-rotated.png";
     }
   } catch (e) {
-    console.warn("Konnte originalen Dateinamen nicht parsen, fallback genutzt.");
+    console.warn(
+      "Konnte originalen Dateinamen nicht parsen, fallback genutzt."
+    );
   }
 
   const key = `rotated/${filename}`;
