@@ -1,312 +1,171 @@
-require("dotenv").config();
-const express = require("express");
-const axios = require("axios");
-const sharp = require("sharp");
-const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+import express from "express";
+import fetch from "node-fetch";
+import sharp from "sharp";
+import dotenv from "dotenv";
+
+dotenv.config();
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
-// ==== ENV VARS ====
-// In Railway als Variables setzen:
-//
-// SHOPIFY_STORE_DOMAIN   -> z.B. my-shop.myshopify.com
-// SHOPIFY_ACCESS_TOKEN   -> Admin API Access Token (Custom App in Shopify)
-//
-// S3_REGION              -> z.B. eu-central-1
-// S3_BUCKET              -> Name des S3-Buckets, z.B. my-rotated-designs
-// AWS_ACCESS_KEY_ID      -> IAM User / Role
-// AWS_SECRET_ACCESS_KEY  -> IAM User / Role
-//
-// PORT                   -> kommt von Railway, fallback 3000
-
-const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
-const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
-
-const S3_REGION = process.env.S3_REGION;
-const S3_BUCKET = process.env.S3_BUCKET;
-
 const PORT = process.env.PORT || 3000;
 
-if (!SHOPIFY_STORE_DOMAIN || !SHOPIFY_ACCESS_TOKEN) {
-  console.error(
-    "Fehlende Env Vars: SHOPIFY_STORE_DOMAIN und/oder SHOPIFY_ACCESS_TOKEN"
-  );
-}
+// Helper: Sleep
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-if (!S3_REGION || !S3_BUCKET) {
-  console.error("Fehlende Env Vars: S3_REGION und/oder S3_BUCKET");
-}
-
-// S3 Client
-const s3Client = new S3Client({
-  region: S3_REGION,
-});
-
-// einfacher Sleep-Helper
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-// ==== HEALTHCHECK ====
+// Root zum Testen
 app.get("/", (req, res) => {
-  res.json({ status: "ok", message: "Shopify image rotate service running" });
+  console.log("GET / called");
+  res.json({ status: "ok", message: "teeinblue rotate service running" });
 });
 
-/**
- * POST /rotate-and-update
- *
- * Erwartet JSON body aus Shopify Flow:
- * {
- *   "image_url": "https://....",
- *   "product_id": 1234567890,
- *   "metafield_namespace": "custom",
- *   "metafield_key": "_tib_design_link_1",
- *   "rotation": 90
- * }
- *
- * rotation optional, default: 90 (Grad im Uhrzeigersinn)
- *
- * Logik:
- * - Erst 3 Minuten warten (Bild-Rendering bei TeeInBlue)
- * - Dann bis zu 4 Versuche, das Bild zu holen und zu verarbeiten
- * - Zwischen den Versuchen jeweils 1 Minute Pause
- */
+// POST /rotate-and-update
 app.post("/rotate-and-update", async (req, res) => {
+  console.log("---- Incoming /rotate-and-update ----");
+  console.log("Body:", JSON.stringify(req.body, null, 2));
+
   const {
     image_url,
     product_id,
     metafield_namespace,
     metafield_key,
-    rotation,
+    rotation
   } = req.body;
 
+  // Wenn das ein Test-Call ist oder Felder fehlen: nur loggen, kein 400 zurückgeben
   if (!image_url || !product_id || !metafield_namespace || !metafield_key) {
-    return res.status(400).json({
-      error:
-        "image_url, product_id, metafield_namespace und metafield_key sind erforderlich",
+    console.log(
+      "Missing required fields (image_url, product_id, metafield_namespace, metafield_key). Skipping work, but returning 200."
+    );
+    return res.status(200).json({
+      status: "skipped",
+      reason: "Missing required fields. No rotation/metafield update executed."
     });
   }
 
-  const rotationAngle = rotation || 90;
+  const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
+  const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
 
-  // Retry-Konfiguration
-  const maxAttempts = 4;
-  const initialDelayMs = 3 * 60 * 1000; // 3 Minuten
-  const retryDelayMs = 60 * 1000; // 1 Minute
-
-  console.log(
-    `Neue Anfrage /rotate-and-update für Produkt ${product_id}, warte zuerst 3 Minuten bevor das Bild geladen wird...`
-  );
-
-  // 1. Initiale Wartezeit (Bild rendern lassen)
-  await sleep(initialDelayMs);
-
-  let lastError = null;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    console.log(
-      `Versuch ${attempt}/${maxAttempts}, Bild von URL laden: ${image_url}`
-    );
-
-    try {
-      // 2. Bild herunterladen
-      const imageResponse = await axios.get(image_url, {
-        responseType: "arraybuffer",
-        validateStatus: (status) => status >= 200 && status < 500, // 4xx selbst behandeln
-      });
-
-      if (imageResponse.status !== 200) {
-        throw new Error(
-          `Bild noch nicht verfügbar oder Fehlerstatus: HTTP ${imageResponse.status}`
-        );
-      }
-
-      const contentType = imageResponse.headers["content-type"] || "";
-      if (!contentType.startsWith("image/")) {
-        throw new Error(
-          `Antwort ist kein Bild. Content-Type: ${contentType || "unbekannt"}`
-        );
-      }
-
-      const originalBuffer = Buffer.from(imageResponse.data);
-
-      // 3. Bild drehen (90° im Uhrzeigersinn, Ausgabe PNG)
-      const rotatedBuffer = await sharp(originalBuffer)
-        .rotate(rotationAngle)
-        .toFormat("png")
-        .toBuffer();
-
-      // 4. Bild in S3 hochladen, URL zurückbekommen
-      const rotatedImageUrl = await uploadToS3AndGetUrl(
-        rotatedBuffer,
-        image_url
-      );
-
-      console.log(
-        `Bild erfolgreich verarbeitet und hochgeladen: ${rotatedImageUrl}`
-      );
-
-      // 5. Produkt-Metafeld aktualisieren
-      const metafieldUpdateResponse = await setProductMetafieldString(
-        product_id,
-        metafield_namespace,
-        metafield_key,
-        rotatedImageUrl
-      );
-
-      console.log(
-        `Metafeld aktualisiert für Produkt ${product_id}, Namespace=${metafield_namespace}, Key=${metafield_key}`
-      );
-
-      // Erfolg – Response zurück an Flow
-      return res.json({
-        success: true,
-        rotated_image_url: rotatedImageUrl,
-        metafield_update_result: metafieldUpdateResponse.data,
-        attempts_used: attempt,
-      });
-    } catch (err) {
-      lastError = err;
-      console.error(
-        `Fehler beim Versuch ${attempt}/${maxAttempts}:`,
-        err.message
-      );
-      if (err.response) {
-        console.error("Response data:", err.response.data);
-      }
-
-      if (attempt < maxAttempts) {
-        console.log(
-          `Warte ${retryDelayMs / 1000} Sekunden vor dem nächsten Versuch...`
-        );
-        await sleep(retryDelayMs);
-      }
-    }
+  if (!SHOPIFY_STORE_DOMAIN || !SHOPIFY_ACCESS_TOKEN) {
+    console.error("Missing SHOPIFY_STORE_DOMAIN or SHOPIFY_ACCESS_TOKEN env vars");
+    return res.status(500).json({ error: "Shopify credentials not configured" });
   }
 
-  console.error(
-    `Maximale Anzahl Versuche (${maxAttempts}) erreicht, Bild konnte nicht erfolgreich geladen/verarbeitet werden.`
-  );
-
-  return res.status(500).json({
-    error:
-      "Bild konnte nach mehreren Versuchen nicht geladen/verarbeitet werden",
-    details: lastError ? lastError.message : "Unbekannter Fehler",
-    attempts_used: maxAttempts,
-  });
-});
-
-/**
- * Bild in S3 hochladen und öffentlich zugängliche URL zurückgeben
- */
-async function uploadToS3AndGetUrl(fileBuffer, originalImageUrl) {
-  if (!S3_BUCKET || !S3_REGION) {
-    throw new Error("S3_BUCKET oder S3_REGION ist nicht gesetzt");
-  }
-
-  // Dateinamen aus originaler URL ableiten
-  let filename = "rotated-" + Date.now() + ".png";
   try {
-    const urlObj = new URL(originalImageUrl);
-    const originalName = urlObj.pathname.split("/").pop();
-    if (originalName) {
-      // denselben Namen verwenden, aber in einen "rotated" Ordner packen
-      filename = originalName.replace(
-        /\.(png|jpg|jpeg|webp)$/i,
-        ""
-      ) + "-rotated.png";
-    }
-  } catch (e) {
-    console.warn(
-      "Konnte originalen Dateinamen nicht parsen, fallback genutzt."
-    );
-  }
+    // 1) Warten 3 Minuten
+    console.log("Waiting 3 minutes before first attempt...");
+    await sleep(3 * 60 * 1000);
 
-  const key = `rotated/${filename}`;
+    const maxAttempts = 4;
+    let lastError = null;
+    let rotatedImageBuffer = null;
+    let finalImageUrl = null;
 
-  const putCommand = new PutObjectCommand({
-    Bucket: S3_BUCKET,
-    Key: key,
-    Body: fileBuffer,
-    ContentType: "image/png",
-    ACL: "public-read", // Achtung: Bucket-Policy muss Public Access erlauben
-  });
-
-  await s3Client.send(putCommand);
-
-  // Standard S3 URL im Virtual-Hosted-Style
-  const publicUrl = `https://${S3_BUCKET}.s3.${S3_REGION}.amazonaws.com/${encodeURIComponent(
-    key
-  ).replace(/%2F/g, "/")}`;
-
-  return publicUrl;
-}
-
-/**
- * Produkt-Metafeld (type: single_line_text_field oder url) als STRING setzen
- */
-async function setProductMetafieldString(
-  productId,
-  namespace,
-  key,
-  valueString
-) {
-  const url = `https://${SHOPIFY_STORE_DOMAIN}/admin/api/2024-07/graphql.json`;
-
-  const query = `
-    mutation MetafieldsSet($metafields: [MetafieldsSetInput!]!) {
-      metafieldsSet(metafields: $metafields) {
-        metafields {
-          id
-          namespace
-          key
-          value
-          type
-          ownerType
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        console.log(`Attempt ${attempt} to download image: ${image_url}`);
+        const resp = await fetch(image_url);
+        if (!resp.ok) {
+          throw new Error(`Image fetch failed with status ${resp.status}`);
         }
-        userErrors {
-          field
-          message
+        const buffer = Buffer.from(await resp.arrayBuffer());
+
+        console.log("Rotating image by", rotation || 90, "degrees");
+        rotatedImageBuffer = await sharp(buffer).rotate(rotation || 90).toBuffer();
+
+        // Hier könntest du dein eigenes Hosting nehmen.
+        // Zum Test: wir tun so, als hätten wir eine neue URL (eigentlich gleich).
+        finalImageUrl = image_url; // TODO: echte Upload-URL nutzen (S3 etc.)
+
+        console.log("Image rotated successfully");
+        break;
+      } catch (err) {
+        console.error(`Error in attempt ${attempt}:`, err);
+        lastError = err;
+        if (attempt < maxAttempts) {
+          console.log("Waiting 1 minute before next attempt...");
+          await sleep(60 * 1000);
         }
       }
     }
-  `;
 
-  const variables = {
-    metafields: [
-      {
-        ownerId: `gid://shopify/Product/${productId}`,
-        namespace: namespace,
-        key: key,
-        type: "single_line_text_field", // oder "url", je nach deiner Definition im Metafeld
-        value: valueString,
-      },
-    ],
-  };
-
-  const response = await axios.post(
-    url,
-    {
-      query,
-      variables,
-    },
-    {
-      headers: {
-        "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
-        "Content-Type": "application/json",
-      },
+    if (!rotatedImageBuffer || !finalImageUrl) {
+      console.error("All attempts to process image failed:", lastError);
+      return res.status(500).json({ error: "Failed to process image" });
     }
-  );
 
-  const errors = response.data?.data?.metafieldsSet?.userErrors || [];
-  if (errors.length > 0) {
-    console.error("Shopify Metafield Errors:", errors);
-    throw new Error("Fehler beim Setzen des Metafelds");
+    // 3) Metafeld in Shopify updaten (GraphQL metafieldsSet)
+    const ownerId = `gid://shopify/Product/${product_id}`;
+    console.log("Updating metafield via Shopify Admin API for ownerId:", ownerId);
+
+    const metafieldsSetMutation = `
+      mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
+        metafieldsSet(metafields: $metafields) {
+          metafields {
+            id
+            namespace
+            key
+            value
+          }
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+    `;
+
+    const metafieldInput = [
+      {
+        ownerId,
+        namespace: metafield_namespace,
+        key: metafield_key,
+        type: "single_line_text_field", // ggf. auf "url" ändern, wenn dein Feld URL-Typ ist
+        value: finalImageUrl
+      }
+    ];
+
+    const gqlResp = await fetch(
+      `https://${SHOPIFY_STORE_DOMAIN}/admin/api/2024-07/graphql.json`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN
+        },
+        body: JSON.stringify({
+          query: metafieldsSetMutation,
+          variables: { metafields: metafieldInput }
+        })
+      }
+    );
+
+    const gqlData = await gqlResp.json();
+    console.log("Shopify metafieldsSet response:", JSON.stringify(gqlData, null, 2));
+
+    const userErrors =
+      gqlData?.data?.metafieldsSet?.userErrors ||
+      gqlData?.errors ||
+      [];
+
+    if (userErrors.length > 0) {
+      console.error("Shopify Metafield Errors:", userErrors);
+      return res.status(500).json({ error: "Failed to set metafield", userErrors });
+    }
+
+    console.log("Metafield updated successfully.");
+    return res.status(200).json({
+      status: "ok",
+      product_id,
+      metafield_namespace,
+      metafield_key,
+      value: finalImageUrl
+    });
+  } catch (err) {
+    console.error("Unexpected error in /rotate-and-update:", err);
+    return res.status(500).json({ error: "Internal error", details: String(err) });
   }
-
-  return response;
-}
+});
 
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
