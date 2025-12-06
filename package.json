@@ -11,11 +11,13 @@
     "image",
     "rotate",
     "metafield",
-    "railway"
+    "railway",
+    "s3"
   ],
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.687.0",
     "axios": "^1.7.0",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
