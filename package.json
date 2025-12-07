@@ -1,16 +1,20 @@
 {
   "name": "teeinblue-rotate-backend",
   "version": "1.0.0",
+  "description": "Backend-Service zum Rotieren von Teeinblue-Designs und Aktualisieren des Shopify-Metafelds",
   "main": "index.js",
   "type": "module",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.685.0",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "node-fetch": "^3.3.2",
-    "sharp": "^0.33.3",
-    "form-data": "^4.0.0"
+    "sharp": "^0.33.3"
+  },
+  "engines": {
+    "node": ">=20.0.0"
   }
 }
