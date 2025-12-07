@@ -65,7 +65,8 @@ async function uploadToR2(buffer, filename) {
 
     await r2Client.send(cmd);
 
-    const finalUrl = `${R2_PUBLIC_BASE_URL.replace(/\/$/, "")}/${key}`;
+    const base = R2_PUBLIC_BASE_URL.replace(/\/$/, "");
+    const finalUrl = `${base}/${key}`;
     console.log("[JOB] Uploaded to R2 URL:", finalUrl);
     return finalUrl;
   } catch (err) {
