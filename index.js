@@ -2,7 +2,7 @@ import express from "express";
 import fetch from "node-fetch";
 import sharp from "sharp";
 import dotenv from "dotenv";
-import FormData from "form-data";
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 
 dotenv.config();
 
@@ -11,171 +11,67 @@ app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
 
+// Shopify-Env
 const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
 const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
 
+// R2-Env
+const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
+const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
+const R2_BUCKET_NAME = process.env.R2_BUCKET_NAME;
+const R2_ENDPOINT = process.env.R2_ENDPOINT; // z.B. https://<accountid>.r2.cloudflarestorage.com
+const R2_PUBLIC_BASE_URL = process.env.R2_PUBLIC_BASE_URL; // z.B. https://pub-xxxxxx.r2.dev
+
+// S3-kompatibler Client für Cloudflare R2
+const r2Client = new S3Client({
+  region: "auto",
+  endpoint: R2_ENDPOINT,
+  credentials: {
+    accessKeyId: R2_ACCESS_KEY_ID,
+    secretAccessKey: R2_SECRET_ACCESS_KEY
+  }
+});
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// ----------------- Helper: Bild in Shopify Files hochladen -----------------
+// ----------------- Helper: Bild in R2 hochladen -----------------
 
-async function uploadToShopifyFiles(buffer, filename) {
-  if (!SHOPIFY_STORE_DOMAIN || !SHOPIFY_ACCESS_TOKEN) {
-    console.error("[JOB] Missing Shopify env vars");
-    throw new Error("Shopify credentials missing");
+async function uploadToR2(buffer, filename) {
+  if (
+    !R2_ACCESS_KEY_ID ||
+    !R2_SECRET_ACCESS_KEY ||
+    !R2_BUCKET_NAME ||
+    !R2_ENDPOINT ||
+    !R2_PUBLIC_BASE_URL
+  ) {
+    console.error("[JOB] Missing R2 env vars");
+    throw new Error("R2 credentials / config missing");
   }
 
-  console.log("[JOB] Creating staged upload for", filename);
+  const key = `rotated/${filename}`;
 
-  // 1) stagedUploadsCreate → S3-Upload-Ziel holen
-  const stagedMutation = `
-    mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
-      stagedUploadsCreate(input: $input) {
-        stagedTargets {
-          url
-          resourceUrl
-          parameters {
-            name
-            value
-          }
-        }
-        userErrors {
-          field
-          message
-        }
-      }
-    }
-  `;
-
-  const stagedVariables = {
-    input: [
-      {
-        resource: "FILE",
-        filename,
-        mimeType: "image/png",
-        httpMethod: "POST"
-      }
-    ]
-  };
-
-  const stagedResp = await fetch(
-    `https://${SHOPIFY_STORE_DOMAIN}/admin/api/2024-07/graphql.json`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN
-      },
-      body: JSON.stringify({
-        query: stagedMutation,
-        variables: stagedVariables
-      })
-    }
-  );
-
-  const stagedData = await stagedResp.json();
-  console.log(
-    "[JOB] stagedUploadsCreate response:",
-    JSON.stringify(stagedData, null, 2)
-  );
-
-  const stagedErrors = stagedData?.data?.stagedUploadsCreate?.userErrors || [];
-  if (stagedErrors.length > 0) {
-    throw new Error(
-      "stagedUploadsCreate userErrors: " + JSON.stringify(stagedErrors)
-    );
-  }
-
-  const target =
-    stagedData?.data?.stagedUploadsCreate?.stagedTargets?.[0] || null;
-  if (!target) {
-    throw new Error("No staged upload target returned");
-  }
-
-  // 2) Datei zu S3 hochladen (multipart/form-data)
-  const form = new FormData();
-  for (const param of target.parameters) {
-    form.append(param.name, param.value);
-  }
-  // Das Feld muss "file" heißen
-  form.append("file", buffer, {
-    filename,
-    contentType: "image/png"
+  console.log("[JOB] Uploading rotated image to R2:", {
+    bucket: R2_BUCKET_NAME,
+    key
   });
 
-  console.log("[JOB] Uploading file buffer to staged URL:", target.url);
-  const uploadResp = await fetch(target.url, {
-    method: "POST",
-    body: form
-  });
+  try {
+    const cmd = new PutObjectCommand({
+      Bucket: R2_BUCKET_NAME,
+      Key: key,
+      Body: buffer,
+      ContentType: "image/png"
+    });
 
-  if (!uploadResp.ok) {
-    const text = await uploadResp.text().catch(() => "");
-    throw new Error(
-      `Staged upload failed with status ${uploadResp.status}: ${text}`
-    );
+    await r2Client.send(cmd);
+
+    const finalUrl = `${R2_PUBLIC_BASE_URL.replace(/\/$/, "")}/${key}`;
+    console.log("[JOB] Uploaded to R2 URL:", finalUrl);
+    return finalUrl;
+  } catch (err) {
+    console.error("[JOB] Error uploading to R2:", err);
+    throw err;
   }
-
-  // 3) filesCreate → aus staged Upload eine File-Ressource machen
-  const filesCreateMutation = `
-    mutation filesCreate($files: [FileCreateInput!]!) {
-      filesCreate(files: $files) {
-        files {
-          id
-          url
-        }
-        userErrors {
-          field
-          message
-        }
-      }
-    }
-  `;
-
-  const filesVariables = {
-    files: [
-      {
-        contentType: "IMAGE",
-        originalSource: target.resourceUrl,
-        altText: filename
-      }
-    ]
-  };
-
-  const filesResp = await fetch(
-    `https://${SHOPIFY_STORE_DOMAIN}/admin/api/2024-07/graphql.json`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN
-      },
-      body: JSON.stringify({
-        query: filesCreateMutation,
-        variables: filesVariables
-      })
-    }
-  );
-
-  const filesData = await filesResp.json();
-  console.log(
-    "[JOB] filesCreate response:",
-    JSON.stringify(filesData, null, 2)
-  );
-
-  const filesErrors = filesData?.data?.filesCreate?.userErrors || [];
-  if (filesErrors.length > 0) {
-    throw new Error(
-      "filesCreate userErrors: " + JSON.stringify(filesErrors)
-    );
-  }
-
-  const file = filesData?.data?.filesCreate?.files?.[0] || null;
-  if (!file || !file.url) {
-    throw new Error("No file with URL returned from filesCreate");
-  }
-
-  console.log("[JOB] Uploaded file URL:", file.url);
-  return file.url; // neue URL auf cdn.shopify.com
 }
 
 // --------------- Hintergrund-Job: Bild drehen + Metafeld updaten ----------
@@ -212,6 +108,7 @@ async function processRotateAndUpdateJob(payload) {
     let lastError = null;
     let rotatedImageBuffer = null;
 
+    // 1) Bild holen + drehen mit max. 4 Versuchen
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         console.log(`[JOB] Attempt ${attempt} to download image: ${image_url}`);
@@ -244,12 +141,9 @@ async function processRotateAndUpdateJob(payload) {
       return;
     }
 
-    // 2) Rotiertes Bild in Shopify Files hochladen
+    // 2) Rotiertes Bild in R2 hochladen
     const filename = `rotated-${product_id}-${Date.now()}.png`;
-    const finalImageUrl = await uploadToShopifyFiles(
-      rotatedImageBuffer,
-      filename
-    );
+    const finalImageUrl = await uploadToR2(rotatedImageBuffer, filename);
 
     // 3) Metafeld in Shopify updaten
     const ownerId = `gid://shopify/Product/${product_id}`;
@@ -304,9 +198,7 @@ async function processRotateAndUpdateJob(payload) {
     );
 
     const userErrors =
-      gqlData?.data?.metafieldsSet?.userErrors ||
-      gqlData?.errors ||
-      [];
+      gqlData?.data?.metafieldsSet?.userErrors || gqlData?.errors || [];
 
     if (userErrors.length > 0) {
       console.error("[JOB] Shopify Metafield Errors:", userErrors);
