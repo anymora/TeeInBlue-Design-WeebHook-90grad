@@ -19,14 +19,14 @@ const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
 const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
 const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
 const R2_BUCKET_NAME = process.env.R2_BUCKET_NAME; // z.B. anymora-rotated-designs
-const R2_ENDPOINT = process.env.R2_ENDPOINT; // z.B. https://<ACCOUNT_ID>.r2.cloudflarestorage.com (OHNE Bucket)
-const R2_PUBLIC_BASE_URL = process.env.R2_PUBLIC_BASE_URL; // z.B. https://pub-xxxx.r2.dev ODER https://pub-xxxx.r2.dev/anymora-rotated-designs
+const R2_ENDPOINT = process.env.R2_ENDPOINT; // https://<ACCOUNT_ID>.r2.cloudflarestorage.com (OHNE Bucket)
+const R2_PUBLIC_BASE_URL = process.env.R2_PUBLIC_BASE_URL; // z.B. https://pub-xxx.r2.dev ODER mit Bucket
 
 // S3-kompatibler Client für Cloudflare R2
 const r2Client = new S3Client({
   region: "auto",
   endpoint: R2_ENDPOINT,
-  forcePathStyle: true, // wichtig für R2
+  forcePathStyle: true,
   credentials: {
     accessKeyId: R2_ACCESS_KEY_ID,
     secretAccessKey: R2_SECRET_ACCESS_KEY
@@ -67,7 +67,7 @@ async function uploadToR2(buffer, filename) {
     const result = await r2Client.send(cmd);
     console.log("[JOB] R2 PutObject result:", result);
 
-    // Public-Base-URL korrekt bauen: ggf. Bucket anhängen
+    // Public-URL korrekt bauen (Bucket ggf. anhängen)
     const base = R2_PUBLIC_BASE_URL.replace(/\/$/, "");
     const bucketSegment = `/${R2_BUCKET_NAME}`;
     const baseWithBucket = base.endsWith(bucketSegment)
@@ -166,6 +166,7 @@ async function processRotateAndUpdateJob(payload) {
             namespace
             key
             value
+            type
           }
           userErrors {
             field
@@ -175,12 +176,13 @@ async function processRotateAndUpdateJob(payload) {
       }
     `;
 
-    // WICHTIG: KEIN "type" mehr setzen -> vorhandene Definition wird genutzt
+    // WICHTIG: Typ setzen (Annahme: Teeinblue nutzt single_line_text_field)
     const metafieldInput = [
       {
         ownerId,
         namespace: metafield_namespace,
         key: metafield_key,
+        type: "single_line_text_field",
         value: finalImageUrl
       }
     ];
@@ -214,50 +216,7 @@ async function processRotateAndUpdateJob(payload) {
       return;
     }
 
-    console.log("[JOB] Metafield updated (no userErrors).");
-
-    // 4) Direkt nach dem Update das Metafeld zurücklesen -> Debug
-    const checkQuery = `
-      query($id: ID!, $namespace: String!, $key: String!) {
-        product(id: $id) {
-          id
-          metafield(namespace: $namespace, key: $key) {
-            namespace
-            key
-            value
-          }
-        }
-      }
-    `;
-
-    const checkResp = await fetch(
-      `https://${SHOPIFY_STORE_DOMAIN}/admin/api/2024-07/graphql.json`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN
-        },
-        body: JSON.stringify({
-          query: checkQuery,
-          variables: {
-            id: ownerId,
-            namespace: metafield_namespace,
-            key: metafield_key
-          }
-        })
-      }
-    );
-
-    const checkData = await checkResp.json();
-    console.log(
-      "[JOB] Metafield after update:",
-      JSON.stringify(checkData, null, 2)
-    );
-
-    const newVal =
-      checkData?.data?.product?.metafield?.value || "(null / not found)";
-    console.log("[JOB] Final metafield value on product:", newVal);
+    console.log("[JOB] Metafield updated successfully to:", finalImageUrl);
   } catch (err) {
     console.error("[JOB] Unexpected error in processRotateAndUpdateJob:", err);
   } finally {
@@ -276,7 +235,6 @@ app.post("/rotate-and-update", (req, res) => {
   console.log("---- Incoming /rotate-and-update ----");
   console.log("Body:", JSON.stringify(req.body, null, 2));
 
-  // Job async starten, Cloudhooks sofort Antwort geben
   processRotateAndUpdateJob(req.body).catch((err) =>
     console.error("Background job error:", err)
   );
