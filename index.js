@@ -18,14 +18,15 @@ const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
 // R2-Env
 const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
 const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
-const R2_BUCKET_NAME = process.env.R2_BUCKET_NAME;
-const R2_ENDPOINT = process.env.R2_ENDPOINT; // z.B. https://<accountid>.r2.cloudflarestorage.com
-const R2_PUBLIC_BASE_URL = process.env.R2_PUBLIC_BASE_URL; // z.B. https://pub-xxxxxx.r2.dev
+const R2_BUCKET_NAME = process.env.R2_BUCKET_NAME; // z.B. anymora-rotated-designs
+const R2_ENDPOINT = process.env.R2_ENDPOINT; // z.B. https://<ACCOUNT_ID>.r2.cloudflarestorage.com (OHNE Bucket)
+const R2_PUBLIC_BASE_URL = process.env.R2_PUBLIC_BASE_URL; // z.B. https://pub-xxxxxx.r2.dev ODER https://pub-xxxxxx.r2.dev/anymora-rotated-designs
 
 // S3-kompatibler Client für Cloudflare R2
 const r2Client = new S3Client({
   region: "auto",
   endpoint: R2_ENDPOINT,
+  forcePathStyle: true, // wichtig für R2
   credentials: {
     accessKeyId: R2_ACCESS_KEY_ID,
     secretAccessKey: R2_SECRET_ACCESS_KEY
@@ -63,10 +64,23 @@ async function uploadToR2(buffer, filename) {
       ContentType: "image/png"
     });
 
-    await r2Client.send(cmd);
+    const result = await r2Client.send(cmd);
+    console.log("[JOB] R2 PutObject result:", result);
 
+    // Public-URL bauen:
+    // R2_PUBLIC_BASE_URL kann entweder
+    //  - https://pub-...r2.dev
+    //  - oder https://pub-...r2.dev/<bucket>
+    // sein. Wenn der Bucket noch fehlt, hängen wir ihn an.
     const base = R2_PUBLIC_BASE_URL.replace(/\/$/, "");
-    const finalUrl = `${base}/${key}`;
+    let publicBaseWithBucket = base;
+    const bucketSegment = `/${R2_BUCKET_NAME}`;
+
+    if (!base.endsWith(bucketSegment)) {
+      publicBaseWithBucket = `${base}${bucketSegment}`;
+    }
+
+    const finalUrl = `${publicBaseWithBucket}/${key}`;
     console.log("[JOB] Uploaded to R2 URL:", finalUrl);
     return finalUrl;
   } catch (err) {
